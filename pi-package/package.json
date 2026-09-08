@@ -1,0 +1,17 @@
+{
+  "name": "tonbo-pi-slack-agent-tools",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "lint": "eslint . --max-warnings=0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/project-brief.js"
+    ]
+  }
+}

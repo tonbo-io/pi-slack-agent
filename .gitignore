@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.pi/npm/
+.pi/git/
+.tonbo
+.tonbo-cache/
+.tonbo-system/
