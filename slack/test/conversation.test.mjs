@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createConversations, createPollBudget } from "../conversation.mjs";
+import {
+  chunkText,
+  createConversations,
+  createPollBudget,
+  remainderAfter,
+} from "../conversation.mjs";
 
 const agentId = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e";
 const base = {
@@ -116,9 +121,10 @@ test("streams deltas into Slack as they arrive and closes with the exact remaind
   assert.deepEqual(slack.calls[5], ["stopStream", "D0CHAN", "1782234700.000100", "", "active"]);
   assert.equal(tonbo.calls[0][0], "submitTurn");
   assert.equal(tonbo.calls[0][3], "hello");
+  // The last read drains anything past the settling page.
   assert.deepEqual(
     tonbo.calls.filter((c) => c[0] === "turnEvents").map((c) => c[1]),
-    [0, 0, 2, 3],
+    [0, 0, 2, 3, 4],
   );
   assert.equal(conversations.active, 0);
 });
@@ -144,7 +150,8 @@ test("pages a long feed within one poll tick before sleeping", async () => {
     },
   });
   await conversations.handle(message);
-  assert.equal(tonbo.calls.filter((c) => c[0] === "turnEvents").length, 2);
+  // Two pages, then one drain read that finds nothing new; no sleep between them.
+  assert.equal(tonbo.calls.filter((c) => c[0] === "turnEvents").length, 3);
   assert.equal(sleeps, 0);
   assert.equal(slack.calls.at(-1)[0], "stopStream");
 });
@@ -566,4 +573,235 @@ test("a Turn that produces nothing for the deadline is given up on", async () =>
   assert.equal(last[0], "stopStream");
   assert.match(last[3], /could not finish this reply: no progress for 30 minutes/);
   assert.equal(tonbo.calls.filter((call) => call[0] === "abortTurn").length, 0);
+});
+
+/** A Slack fake whose streams get distinct timestamps, for multi-message replies. */
+function numberedSlack() {
+  const slack = fakeSlack();
+  let opened = 0;
+  slack.startStream = async ({ channelId, threadTs, userId, teamId, text }) => {
+    opened += 1;
+    const ts = `1782234700.${String(opened).padStart(6, "0")}`;
+    slack.calls.push(["startStream", channelId, threadTs, userId, teamId, text, ts]);
+    return ts;
+  };
+  return slack;
+}
+const chars = (n, c = "x") => c.repeat(n);
+const streamedText = (slack) =>
+  slack.calls
+    .filter(
+      (call) => call[0] === "startStream" || call[0] === "appendStream" || call[0] === "stopStream",
+    )
+    .map((call) => (call[0] === "startStream" ? call[5] : call[3]))
+    .join("");
+
+test("a long recorded remainder is appended in Slack-sized chunks", async () => {
+  const slack = numberedSlack();
+  const remainder = chars(30_000, "é");
+  const tonbo = fakeTonbo({
+    pages: [{ events: [delta(1, "Intro. ")], status: "completed" }],
+    submit: { state: "completed", data: { assistant_text: "Intro. " + remainder } },
+    settleAfterFeed: true,
+  });
+  await createConversations({ ...base, tonbo, slack }).handle(message);
+  const appends = slack.calls.filter((call) => call[0] === "appendStream");
+  assert.deepEqual(
+    appends.map((call) => [...call[3]].length),
+    [12_000, 12_000, 6_000],
+  );
+  assert.equal(slack.calls.filter((call) => call[0] === "startStream").length, 1);
+  assert.equal(slack.calls.filter((call) => call[0] === "stopStream").length, 1);
+  assert.equal(streamedText(slack), "Intro. " + remainder);
+});
+
+test("a reply past Slack's message cap continues as another message in the thread", async () => {
+  const slack = numberedSlack();
+  const text = chars(90_000);
+  const tonbo = fakeTonbo({
+    pages: [{ events: [delta(1, text.slice(0, 5_000))], status: "completed" }],
+    submit: { state: "completed", data: { assistant_text: text } },
+    settleAfterFeed: true,
+  });
+  await createConversations({ ...base, tonbo, slack }).handle(message);
+  const starts = slack.calls.filter((call) => call[0] === "startStream");
+  const stops = slack.calls.filter((call) => call[0] === "stopStream");
+  assert.ok(starts.length >= 2, "the reply continued in a second message");
+  assert.equal(stops.length, starts.length);
+  for (const start of starts) assert.equal(start[2], message.ts);
+  assert.deepEqual(
+    stops.map((call) => call[4]),
+    [...stops.slice(0, -1).map(() => "processing"), "active"],
+  );
+  // Each closed message names the stream that was open at the time, in order.
+  assert.deepEqual(
+    stops.map((call) => call[2]),
+    starts.map((call) => call[6]),
+  );
+  for (const call of slack.calls)
+    if (call[0] === "appendStream" || call[0] === "startStream")
+      assert.ok([...(call[0] === "startStream" ? call[5] : call[3])].length <= 12_000);
+  assert.equal(streamedText(slack), text);
+  assert.equal([...streamedText(slack)].length, 90_000);
+});
+
+test("a stop during the continuation closes the message that is open", async () => {
+  const slack = numberedSlack();
+  let releaseSecond;
+  const secondOpening = new Promise((resolve) => (releaseSecond = resolve));
+  const open = slack.startStream;
+  let opened = 0;
+  slack.startStream = async (input) => {
+    opened += 1;
+    if (opened === 2) await secondOpening;
+    return open(input);
+  };
+  let submitted;
+  const tonbo = fakeTonbo({ submit: () => new Promise((resolve) => (submitted = resolve)) });
+  let served = 0;
+  tonbo.turnEvents = async () =>
+    (served += 1) === 1
+      ? { events: [delta(1, chars(36_000)), delta(2, chars(12_000))], status: "pending" }
+      : new Promise((resolve) => setTimeout(() => resolve({ events: [], status: "pending" }), 5));
+  const conversations = createConversations({
+    ...base,
+    tonbo,
+    slack,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms || 1)),
+  });
+  const prompt = conversations.handle(message);
+  while (slack.calls.filter((call) => call[0] === "stopStream").length < 1)
+    await new Promise((r) => setTimeout(r, 1));
+  // The first message is closed and the second is opening: stop now.
+  await conversations.handle(stop);
+  releaseSecond();
+  submitted({ state: "completed", data: { assistant_text: chars(48_000) } });
+  await prompt;
+  const stops = slack.calls.filter((call) => call[0] === "stopStream");
+  assert.equal(stops.length, 2);
+  assert.deepEqual(stops[0].slice(2), ["1782234700.000001", "", "processing"]);
+  assert.deepEqual(stops[1].slice(2), ["1782234700.000002", "\n\n_Stopped._", "active"]);
+  assert.ok(tonbo.calls.some((call) => call[0] === "abortTurn"));
+});
+
+test("a failure notice that would overflow the message goes into a new one, bounded", async () => {
+  const slack = numberedSlack();
+  const tonbo = fakeTonbo({
+    submit: {
+      state: "failed",
+      code: "turn_failed",
+      message: "turn failed: " + chars(5_000, "m"),
+    },
+  });
+  let served = 0;
+  tonbo.turnEvents = async () =>
+    (served += 1) === 1
+      ? { events: [delta(1, chars(37_990))], status: "pending" }
+      : { events: [], status: "failed" };
+  await createConversations({ ...base, tonbo, slack }).handle(message);
+  const stops = slack.calls.filter((call) => call[0] === "stopStream");
+  const starts = slack.calls.filter((call) => call[0] === "startStream");
+  assert.equal(starts.length, 2);
+  assert.deepEqual(stops[0].slice(2), ["1782234700.000001", "", "processing"]);
+  assert.match(starts[1][5], /^\n\nThe Agent could not finish this reply: turn failed: m+$/);
+  assert.ok([...starts[1][5]].length <= 12_000);
+  assert.ok([...starts[1][5]].length < 1_100, "the reason is bounded");
+  assert.deepEqual(stops[1].slice(2), ["1782234700.000002", "", "active"]);
+});
+
+test("splits on characters, never inside a surrogate pair", () => {
+  const text = "😀".repeat(12_001);
+  const chunks = chunkText(text);
+  assert.equal(chunks.length, 2);
+  assert.equal([...chunks[0]].length, 12_000);
+  assert.equal(chunks[1], "😀");
+  assert.deepEqual(chunkText(""), []);
+});
+
+test("the recorded answer is the last assistant message; its unstreamed tail is appended once", async () => {
+  const slack = numberedSlack();
+  const last = "Read both. Here's my exploration of the brief in full.";
+  const tonbo = fakeTonbo({
+    pages: [
+      { events: [delta(1, "I'll read the brief first.")], status: "pending" },
+      { events: [delta(2, "Read both. Here's my")], status: "completed" },
+      { events: [] },
+    ],
+    submit: { state: "completed", data: { assistant_text: last } },
+    settleAfterFeed: true,
+  });
+  const logs = [];
+  await createConversations({ ...base, tonbo, slack, log: (e, f) => logs.push([e, f]) }).handle(
+    message,
+  );
+  assert.equal(streamedText(slack), "I'll read the brief first." + last);
+  assert.deepEqual(logs.find(([e]) => e === "turn_remainder")[1].branch, "suffix");
+});
+
+test("events that land after the settling page are drained before the answer is closed", async () => {
+  const slack = numberedSlack();
+  const full = "Alpha. Beta. Gamma.";
+  const tonbo = fakeTonbo({
+    pages: [
+      { events: [delta(1, "Alpha. ")], status: "completed" },
+      { events: [delta(2, "Beta. ")], status: "completed" },
+      { events: [delta(3, "Gamma.")], status: "completed" },
+      { events: [], status: "completed" },
+    ],
+    submit: { state: "completed", data: { assistant_text: full } },
+    settleAfterFeed: true,
+  });
+  await createConversations({ ...base, tonbo, slack }).handle(message);
+  assert.deepEqual(
+    tonbo.calls.filter((c) => c[0] === "turnEvents").map((c) => c[1]),
+    [0, 1, 2, 3],
+  );
+  assert.equal(streamedText(slack), full);
+  assert.equal(slack.calls.filter((c) => c[0] === "stopStream").length, 1);
+});
+
+test("computes the tail of the recorded answer against what was streamed", () => {
+  assert.deepEqual(remainderAfter("Hello", "Hello world"), { text: " world", branch: "prefix" });
+  assert.deepEqual(remainderAfter("first.Read both. Here", "Read both. Here's more"), {
+    text: "'s more",
+    branch: "suffix",
+  });
+  assert.deepEqual(remainderAfter("", "Answer"), { text: "Answer", branch: "unstreamed" });
+  assert.deepEqual(remainderAfter("Whole answer here", "answer"), {
+    text: "",
+    branch: "contained",
+  });
+  assert.deepEqual(remainderAfter("Something else", "Answer"), {
+    text: "\n\nAnswer",
+    branch: "disjoint",
+  });
+  assert.deepEqual(remainderAfter("Streamed", ""), { text: "", branch: "empty" });
+  assert.deepEqual(remainderAfter("Same", "Same"), { text: "", branch: "prefix" });
+});
+
+test("an empty recorded answer with nothing streamed says so, and with text streamed closes quietly", async () => {
+  const quiet = numberedSlack();
+  await createConversations({
+    ...base,
+    tonbo: fakeTonbo({
+      pages: [{ events: [], status: "completed" }],
+      submit: { state: "completed", data: { assistant_text: "" } },
+    }),
+    slack: quiet,
+  }).handle(message);
+  assert.equal(
+    quiet.calls.find((c) => c[0] === "startStream")[5],
+    "The Agent completed without a text response.",
+  );
+  const partial = numberedSlack();
+  await createConversations({
+    ...base,
+    tonbo: fakeTonbo({
+      pages: [{ events: [delta(1, "Only streamed")], status: "completed" }],
+      submit: { state: "completed", data: { assistant_text: "" } },
+    }),
+    slack: partial,
+  }).handle(message);
+  assert.equal(streamedText(partial), "Only streamed");
+  assert.equal(partial.calls.filter((c) => c[0] === "appendStream").length, 0);
 });
