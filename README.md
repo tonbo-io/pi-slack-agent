@@ -39,3 +39,13 @@ node --test slack/test/*.test.mjs
 ```
 
 To develop interactively, use the Pi CLI in the repository root. For a Tonbo CLI workflow, run `tonbo init`, choose **Use an existing agent**, select the Agent created in the browser, and configure the supported native Pi target before deploying. Local tooling is optional for the browser onboarding experience.
+
+The service runs from revision-isolated application source. Durable files, including Slack attachments and recovery state, belong under `TONBO_WORKSPACE_DIR` (`/workspace`); relative source imports continue to resolve from the deployed revision. Publish source changes through a new deployment.
+
+## Upgrade and recovery behavior
+
+The service acquires named runtime Activity and synchronously saves its Turn checkpoint before acknowledging a prompt event. Ownership lasts through response delivery and Slack status cleanup. Completed checkpoints remain as small deduplication tombstones. A newer revision can serve new requests while the original process finishes its admitted replies; startup recovery skips work still owned by another process. Stop resolves the persisted Turn identity and can reach a Turn on the draining runtime.
+
+Checkpoints preserve the prompt, acknowledged response text, partial event offset and open Slack stream. They are serialized and atomically replaced in Workspace. An uncertain Slack write is retained for reconciliation, rather than replayed or declared successful. Corrupt records are retained and fail closed. Lease expiry does not authorize another process to emit effects.
+
+An unexpected service exit makes runtime health unavailable; the platform physically retires that runtime before another process may recover its named work. In-process service restart is deliberately removed because it cannot establish that the old execution owner is fenced. Snapshot and node-transfer acceptance remain separate from deployment overlap.

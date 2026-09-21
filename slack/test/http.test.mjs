@@ -14,13 +14,18 @@ async function withHandler(options, run) {
     signingSecret: secret,
     teamId: "T0AAA",
     seen: new SeenEvents(),
-    onEvent: async (event) => {
+    onAccept: async (event) => async () => {
       events.push(event);
       await gate;
     },
     ...options,
   });
-  const server = createServer((request, response) => handler(request, response));
+  const server = createServer((request, response) => {
+    handler(request, response).catch(() => {
+      if (!response.headersSent) response.writeHead(500);
+      response.end();
+    });
+  });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const post = async (
@@ -122,4 +127,68 @@ test("ignores events for another workspace and malformed callbacks", async () =>
     );
     assert.equal(events.length, 0);
   });
+});
+
+test("failed durable acceptance is not ACKed or deduplicated away on retry", async () => {
+  let accepted = 0;
+  let delivered = 0;
+  const seen = new SeenEvents();
+  await withHandler(
+    {
+      seen,
+      onAccept: async () => {
+        accepted += 1;
+        if (accepted === 1) throw new Error("checkpoint fsync failed");
+        return async () => {
+          delivered += 1;
+        };
+      },
+    },
+    async ({ post }) => {
+      const event = callback("Ev-durable", { type: "message" });
+      assert.equal((await post(event)).status, 500);
+      assert.equal(seen.has("Ev-durable"), false);
+      assert.equal(delivered, 0);
+      assert.equal((await post(event, { retry: "1" })).status, 200);
+      assert.equal(accepted, 2);
+      assert.equal(delivered, 1);
+    },
+  );
+});
+
+test("acceptance persistence completes before the event enters the ACK dedupe set", async () => {
+  let persisted = false;
+  let entered;
+  let persist;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    persist = resolve;
+  });
+  const seen = new SeenEvents();
+  const remember = seen.remember.bind(seen);
+  seen.remember = (id) => {
+    assert.equal(persisted, true);
+    remember(id);
+  };
+  await withHandler(
+    {
+      seen,
+      onAccept: async () => {
+        entered();
+        await gate;
+        persisted = true;
+        return async () => {};
+      },
+    },
+    async ({ post }) => {
+      const response = post(callback("Ev-persist", { type: "message" }));
+      await started;
+      assert.equal(seen.has("Ev-persist"), false);
+      persist();
+      assert.equal((await response).status, 200);
+      assert.equal(seen.has("Ev-persist"), true);
+    },
+  );
 });

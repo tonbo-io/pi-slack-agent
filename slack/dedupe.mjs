@@ -18,6 +18,9 @@ export class SeenEvents {
     if (this.#ids.size > this.#limit) this.#ids.delete(this.#ids.keys().next().value);
     return false;
   }
+  has(id) {
+    return this.#ids.has(id);
+  }
   get size() {
     return this.#ids.size;
   }

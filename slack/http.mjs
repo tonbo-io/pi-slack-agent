@@ -26,7 +26,7 @@ export function createSlackRequestHandler({
   signingSecret,
   teamId,
   seen,
-  onEvent,
+  onAccept,
   log = () => {},
   now,
 }) {
@@ -75,14 +75,16 @@ export function createSlackRequestHandler({
     if (typeof payload.event_id !== "string" || !event || typeof event !== "object")
       return end(400);
     const retry = request.headers["x-slack-retry-num"];
-    if (seen.remember(payload.event_id)) {
+    if (seen.has(payload.event_id)) {
       log("slack_event_duplicate", { retry: typeof retry === "string" ? retry : null });
       return end(200);
     }
+    const run = await onAccept(event);
+    seen.remember(payload.event_id);
     end(200);
-    // Acknowledged: Slack's 3-second budget is spent; the work continues here.
+    // Durable acceptance precedes ACK; response delivery owns background Activity.
     Promise.resolve()
-      .then(() => onEvent(event))
+      .then(run)
       .catch((error) => log("slack_event_failed", { type: event.type, reason: error?.message }));
   };
 }

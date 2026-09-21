@@ -1,3 +1,4 @@
+import { createActivityClient } from "./activity.mjs";
 import { createServer } from "node:http";
 import { createConversations } from "./conversation.mjs";
 import { SeenEvents } from "./dedupe.mjs";
@@ -20,7 +21,9 @@ const tonbo = createTonboClient({
   apiKey: required("TONBO_AGENT_API_KEY"),
   agentId: required("TONBO_AGENT_ID"),
 });
+const activities = createActivityClient({ origin: required("TONBO_ACTIVITY_URL") });
 const conversations = createConversations({
+  activities,
   tonbo,
   slack,
   agentId: required("TONBO_AGENT_ID"),
@@ -32,9 +35,13 @@ const handler = createSlackRequestHandler({
   signingSecret: required("SLACK_SIGNING_SECRET"),
   teamId: required("SLACK_TEAM_ID"),
   seen: new SeenEvents(),
-  onEvent: (event) => conversations.handle(event),
+  onAccept: (event) => conversations.accept(event),
   log,
 });
+const recover = () =>
+  conversations.resume().catch((error) => log("slack_recovery_failed", { reason: error?.message }));
+await recover();
+setInterval(recover, 5000).unref();
 const port = Number(process.env.PORT || 9080);
 const server = createServer((request, response) => {
   handler(request, response).catch((error) => {

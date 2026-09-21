@@ -2,10 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   chunkText,
-  createConversations,
+  createConversations as createConversationsImpl,
   createPollBudget,
   remainderAfter,
 } from "../conversation.mjs";
+
+function createConversations(options) {
+  const records = new Map();
+  return createConversationsImpl({
+    activities: { acquire: async () => ({ assertOwned() {}, abandon() {}, async release() {} }) },
+    store: {
+      get: async (id) => records.get(id) ?? null,
+      save: async (turn) => {
+        const { lease, effectQueue, ...record } = turn;
+        records.set(turn.turnId, structuredClone(record));
+      },
+      complete: async (turn) => records.set(turn.turnId, { turnId: turn.turnId, completed: true }),
+      list: async () => [...records.values()].filter((record) => !record.completed),
+    },
+    ...options,
+  });
+}
 
 const agentId = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e";
 const base = {
@@ -380,7 +397,7 @@ test("a stop that lands while the stream is opening still closes it", async () =
   assert.equal(slack.calls.filter((call) => call[0] === "stopStream").length, 1);
 });
 
-test("an unexpected error after the stream opened closes it with a notice", async () => {
+test("an uncertain Slack append preserves ownership without another provider write", async () => {
   const slack = fakeSlack();
   const tonbo = fakeTonbo({
     submit: { state: "completed", data: { assistant_text: "partial done" } },
@@ -392,11 +409,32 @@ test("an unexpected error after the stream opened closes it with a notice", asyn
   slack.appendStream = async () => {
     throw new Error("slack exploded");
   };
-  await createConversations({ ...base, tonbo, slack }).handle(message);
-  const last = slack.calls.at(-1);
-  assert.equal(last[0], "stopStream");
-  assert.match(last[3], /could not finish this reply: slack exploded/);
-  assert.equal(last[4], "active");
+  const records = new Map();
+  let released = false;
+  await createConversations({
+    ...base,
+    tonbo,
+    slack,
+    activities: {
+      acquire: async () => ({
+        assertOwned() {},
+        abandon() {},
+        async release() {
+          released = true;
+        },
+      }),
+    },
+    store: {
+      get: async (id) => records.get(id),
+      save: async (turn) => records.set(turn.turnId, { pendingEffect: turn.pendingEffect }),
+      complete: async () => {
+        throw new Error("Uncertain write must not complete");
+      },
+    },
+  }).handle(message);
+  assert.equal(slack.calls.at(-1)[0], "startStream");
+  assert.equal([...records.values()][0].pendingEffect.kind, "append");
+  assert.equal(released, false);
 });
 
 test("retries a rate-limited Slack write once after the pause Slack asks for", async () => {
@@ -546,7 +584,7 @@ test("a lost operation poll is retried instead of failing the Turn", async () =>
   assert.equal(slack.calls.at(-1)[0], "stopStream");
 });
 
-test("a Turn that produces nothing for the deadline is given up on", async () => {
+test("a stalled Turn retains its checkpoint and ownership without claiming completion", async () => {
   const slack = fakeSlack();
   let clock = 0;
   let reads = 0;
@@ -570,8 +608,9 @@ test("a Turn that produces nothing for the deadline is given up on", async () =>
   assert.ok(reads <= 5, `gave up after ${reads} reads`);
   assert.ok(logs.includes("turn_no_progress"));
   const last = slack.calls.at(-1);
-  assert.equal(last[0], "stopStream");
-  assert.match(last[3], /could not finish this reply: no progress for 30 minutes/);
+  assert.equal(last[0], "startStream");
+  assert.ok(logs.includes("turn_reconciliation_required"));
+  assert.equal(slack.calls.filter((call) => call[0] === "stopStream").length, 0);
   assert.equal(tonbo.calls.filter((call) => call[0] === "abortTurn").length, 0);
 });
 
@@ -805,3 +844,155 @@ test("an empty recorded answer with nothing streamed says so, and with text stre
   assert.equal(streamedText(partial), "Only streamed");
   assert.equal(partial.calls.filter((c) => c[0] === "appendStream").length, 0);
 });
+
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createInflightStore } from "../inflight.mjs";
+import { slackAgentInput } from "../identity.mjs";
+
+async function durableFixture(run) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "slack-owner-"));
+  try {
+    await run(createInflightStore({ directory }));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+function ownerships() {
+  const owners = new Map();
+  return (owner, released = () => {}) => ({
+    async acquire(work) {
+      if (owners.has(work) && owners.get(work) !== owner) return null;
+      owners.set(work, owner);
+      let valid = true;
+      return {
+        assertOwned() {
+          assert.ok(valid && owners.get(work) === owner);
+        },
+        abandon() {
+          valid = false;
+        },
+        async release() {
+          owners.delete(work);
+          released();
+        },
+      };
+    },
+  });
+}
+test("overlapping application processes neither replay owned work nor completed tombstones", () =>
+  durableFixture(async (store) => {
+    const activity = ownerships();
+    const oldSlack = fakeSlack();
+    const newSlack = fakeSlack();
+    const tonbo = fakeTonbo({
+      pages: [{ events: [], status: "completed" }],
+      submit: { state: "completed", data: { assistant_text: "once" } },
+    });
+    const old = createConversations({
+      ...base,
+      store,
+      activities: activity("old"),
+      slack: oldSlack,
+      tonbo,
+    });
+    const next = createConversations({
+      ...base,
+      store,
+      activities: activity("new"),
+      slack: newSlack,
+      tonbo,
+    });
+    const run = await old.accept(message);
+    assert.equal((await store.list()).length, 1);
+    assert.equal(oldSlack.calls.length, 0, "acceptance must precede provider effects");
+    await next.handle(message);
+    assert.equal(newSlack.calls.length, 0);
+    await run();
+    await next.handle(message);
+    assert.equal(newSlack.calls.length, 0);
+    assert.equal(tonbo.calls.filter(([name]) => name === "submitTurn").length, 1);
+  }));
+test("restart resumes partial event offset and fetches the original Turn's final answer", () =>
+  durableFixture(async (store) => {
+    const command = slackAgentInput({
+      agentId,
+      teamId: base.teamId,
+      botUserId: base.botUserId,
+      event: message,
+    });
+    await store.save({
+      ...command,
+      turnId: command.idempotencyKey,
+      command,
+      prompt: "hello",
+      streamed: "He",
+      streamTs: "1782234700.000100",
+      messageChars: 2,
+      cursor: 0,
+      startedAt: Date.now(),
+      processingEvent: { sequence: 1, text: "Hello", offset: 2 },
+      pendingEffect: null,
+      closed: false,
+    });
+    const slack = fakeSlack();
+    const tonbo = fakeTonbo({
+      pages: [
+        { events: [delta(1, "Hello")], status: "completed" },
+        { events: [], status: "completed" },
+      ],
+      submit: { state: "completed", data: { assistant_text: "Hello" } },
+    });
+    let resolve;
+    const completed = new Promise((done) => {
+      resolve = done;
+    });
+    const conversations = createConversations({
+      ...base,
+      store,
+      slack,
+      tonbo,
+      activities: ownerships()("new", resolve),
+    });
+    await conversations.resume();
+    await completed;
+    assert.deepEqual(
+      slack.calls.filter(([name]) => name === "appendStream").map((call) => call[3]),
+      ["llo"],
+    );
+    assert.equal(slack.calls.filter(([name]) => name === "startStream").length, 0);
+    assert.equal(tonbo.calls.find(([name]) => name === "submitTurn")[3], "hello");
+    assert.equal((await store.get(command.idempotencyKey)).completed, true);
+  }));
+test("new runtime routes Stop to the persisted old Turn without taking its stream", () =>
+  durableFixture(async (store) => {
+    const command = slackAgentInput({
+      agentId,
+      teamId: base.teamId,
+      botUserId: base.botUserId,
+      event: message,
+    });
+    await store.save({
+      ...command,
+      turnId: command.idempotencyKey,
+      command,
+      streamTs: "1782234700.000100",
+    });
+    const slack = fakeSlack();
+    const tonbo = fakeTonbo({});
+    await createConversations({
+      ...base,
+      store,
+      slack,
+      tonbo,
+      activities: {
+        acquire() {
+          throw new Error("Stop must not seize response ownership");
+        },
+      },
+    }).handle(stop);
+    assert.equal(tonbo.calls[0][0], "abortTurn");
+    assert.equal(slack.calls.length, 0);
+    assert.equal((await store.list()).length, 1);
+  }));
