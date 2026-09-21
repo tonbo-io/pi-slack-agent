@@ -1,0 +1,14 @@
+version = 2
+
+[harness]
+runtime = "pi"
+
+[harness.driver]
+kind = "native"
+
+[inference]
+model = "claude-sonnet-5"
+
+[service]
+command = [ "node", "slack/server.mjs" ]
+secrets = [ "SLACK_SIGNING_SECRET", "SLACK_BOT_TOKEN", "SLACK_BOT_USER_ID", "SLACK_TEAM_ID", "TONBO_AGENT_API_KEY", "TONBO_AGENT_API_ORIGIN", "TONBO_IAM_ORIGIN" ]
