@@ -6,6 +6,10 @@ const STOPPED_LINE = "\n\n_Stopped._";
 const BUSY_RETRY_LIMIT = 150;
 const MAX_POLL_MS = 5000;
 const MAX_RETRY_AFTER_SECONDS = 3600;
+const TRANSPORT_RETRY_MS = 5000;
+/** A Turn that has produced nothing for this long is given up on; the
+ * platform's own recovery owns whatever is still running. */
+export const NO_PROGRESS_DEADLINE_MS = 30 * 60 * 1000;
 
 function noticeFor(message) {
   return `The Agent could not finish this reply: ${message}`;
@@ -42,6 +46,8 @@ export function createConversations({
   log = () => {},
   pollMs = 1000,
   budget = createPollBudget(),
+  deadlineMs = NO_PROGRESS_DEADLINE_MS,
+  now = () => Date.now(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   const threads = new Map();
@@ -76,30 +82,57 @@ export function createConversations({
     }
   }
 
-  async function submitWithBusyRetry(turn, prompt) {
-    for (let attempt = 0; ; attempt += 1) {
-      const result = await tonbo.submitTurn(turn.sessionId, turn.turnId, prompt);
-      if (
-        result.state === "failed" &&
-        result.code === "agent_busy" &&
-        attempt < BUSY_RETRY_LIMIT &&
-        !turn.cancelled
-      ) {
+  const isTransport = (error) => error?.code === "transport";
+
+  /** Drives the submission until the Management API states the Turn's
+   * outcome. The Turn id is the idempotency key, so a request that never
+   * answered (our timeout, a reset) is simply sent again: the server answers
+   * a running Turn by waiting for it and a settled one at once. A transport
+   * failure is never the Turn's outcome; only the API's own answer is. */
+  async function driveSubmission(turn, prompt) {
+    for (let busy = 0; !turn.cancelled && !turn.done;) {
+      let result;
+      try {
+        result = await tonbo.submitTurn(turn.sessionId, turn.turnId, prompt);
+      } catch (error) {
+        if (!isTransport(error)) throw error;
+        log("turn_submit_unanswered", { turn: turn.turnId, reason: error.message });
+        await sleep(TRANSPORT_RETRY_MS);
+        continue;
+      }
+      if (result.state === "failed" && result.code === "agent_busy" && busy < BUSY_RETRY_LIMIT) {
+        busy += 1;
         await sleep((result.retryAfterSeconds ?? 2) * 1000);
         continue;
       }
-      return result;
+      if (result.state !== "pending") return result;
+      if (!result.operationId) {
+        await sleep(TRANSPORT_RETRY_MS);
+        continue;
+      }
+      const outcome = await awaitOperation(turn, result.operationId);
+      if (outcome) return outcome;
     }
+    return { state: "pending" };
   }
 
-  async function awaitOutcome(turn, first) {
-    let outcome = first;
-    while (outcome.state === "pending" && !turn.cancelled) {
+  /** Polls a 202 operation. Resolves null when the operation vanished or the
+   * Turn ended meanwhile, so the caller resubmits and gets the recorded answer. */
+  async function awaitOperation(turn, operationId) {
+    while (!turn.cancelled && !turn.done) {
       await sleep(Math.max(pollMs, 1000) + budget.reserve());
-      if (!outcome.operationId) return outcome;
-      outcome = await tonbo.operation(outcome.operationId);
+      let outcome;
+      try {
+        outcome = await tonbo.operation(operationId);
+      } catch (error) {
+        if (!isTransport(error)) throw error;
+        log("turn_operation_unanswered", { turn: turn.turnId, reason: error.message });
+        continue;
+      }
+      if (outcome.state === "failed" && outcome.status === 404) return null;
+      if (outcome.state !== "pending") return outcome;
     }
-    return outcome;
+    return null;
   }
 
   async function stream(turn, text) {
@@ -127,7 +160,7 @@ export function createConversations({
     await slackWrite(() => slack.stopStream(turn.channelId, turn.streamTs, STOPPED_LINE, "active"));
   }
 
-  async function follow(turn, outcomePromise) {
+  async function follow(turn, outcomePromise, prompt) {
     let settled = null;
     const settling = outcomePromise.then(
       (value) => {
@@ -139,16 +172,20 @@ export function createConversations({
         return settled;
       },
     );
-    // The feed can report completion before the submission answers with the
-    // recorded text; give that answer a moment so the remainder is exact.
+    // The feed says the Turn is over; the recorded answer comes from the
+    // submission. If that request is still open or was lost, replay it: the
+    // idempotent key answers a settled Turn at once.
     const outcome = async (status) => {
-      if (!settled) {
-        const grace = new Promise((resolve) => setTimeout(resolve, 5000).unref());
-        await Promise.race([settling, grace]);
+      turn.done = true;
+      if (!settled || settled.state === "pending") await Promise.race([settling, sleep(5000)]);
+      if (status === "completed" && settled?.state !== "completed") {
+        settled = await tonbo
+          .submitTurn(turn.sessionId, turn.turnId, prompt)
+          .catch((error) => ({ state: "unknown", message: error?.message }));
       }
       return { status, settled };
     };
-    let missing = 0;
+    let progressAt = now();
     let idle = 0;
     while (!turn.cancelled) {
       let page;
@@ -162,13 +199,11 @@ export function createConversations({
             delay = Math.min(error.retryAfterSeconds ?? 60, MAX_RETRY_AFTER_SECONDS) * 1000;
           return { events: [], status: "pending" };
         });
-        if (page === null) {
-          missing += 1;
-          break;
-        }
+        if (page === null) break;
         for (const event of page.events) {
           turn.cursor = Math.max(turn.cursor, Number(event.sequence) || 0);
           progressed = true;
+          progressAt = now();
           if (event.event_type === "assistant.delta" && typeof event.payload?.text === "string")
             await stream(turn, event.payload.text);
         }
@@ -178,11 +213,17 @@ export function createConversations({
       // and the settled answer is the only signal. A pending answer with an
       // absent feed is a Turn the coordinator has not claimed yet.
       if (settled && settled.state !== "pending") return outcome(settled.state);
-      if (missing > 600)
+      if (now() - progressAt > deadlineMs) {
+        turn.done = true;
+        log("turn_no_progress", { turn: turn.turnId, minutes: Math.round(deadlineMs / 60_000) });
         return {
           status: "failed",
-          settled: { state: "failed", message: "The Turn never started." },
+          settled: {
+            state: "failed",
+            message: `no progress for ${Math.round(deadlineMs / 60_000)} minutes`,
+          },
         };
+      }
       // Back off while nothing arrives; a delta resets the cadence.
       // A refusal already imposed its own pause; start the backoff afresh after it.
       idle = progressed || delay !== null ? 0 : idle + 1;
@@ -247,6 +288,7 @@ export function createConversations({
       cursor: 0,
       cancelled: false,
       closed: false,
+      done: false,
     };
     turns.set(turn.turnId, turn);
     threads.set(id, turn);
@@ -256,9 +298,9 @@ export function createConversations({
         command.prompt || "Please look at the attached file.",
         command.files,
       );
-      const outcome = submitWithBusyRetry(turn, prompt).then((first) => awaitOutcome(turn, first));
+      const outcome = driveSubmission(turn, prompt);
       outcome.catch(() => {});
-      const result = await follow(turn, outcome);
+      const result = await follow(turn, outcome, prompt);
       await finish(turn, result);
       log("turn_finished", { turn: turn.turnId, status: result.status });
     } catch (error) {
@@ -294,6 +336,7 @@ export function createConversations({
       return;
     }
     turn.cancelled = true;
+    turn.done = true;
     threads.delete(id);
     const abort = tonbo
       .abortTurn(turn.sessionId, turn.turnId, command.idempotencyKey)

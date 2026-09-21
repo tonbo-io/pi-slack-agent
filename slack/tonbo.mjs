@@ -4,6 +4,22 @@
 export const MANAGEMENT_API_AUDIENCE = "https://api.tonbo.dev";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+/** The request never received an answer: a timeout, a reset, a DNS failure.
+ * The server may still be doing the work; callers must not treat this as
+ * the Turn's outcome. */
+export class TonboTransportError extends Error {
+  constructor(cause) {
+    super(cause?.message || "Management API request failed");
+    this.code = "transport";
+    this.cause = cause;
+  }
+}
+
+/** The Management API holds a Turn submission open until the Turn settles,
+ * up to five minutes, then answers 202. The client waits longer than that;
+ * every other call answers at once. */
+export const SUBMIT_TIMEOUT_MS = 330_000;
+
 export class TonboRequestError extends Error {
   constructor(status, code, message, retryAfterSeconds) {
     super(message || code || `Management API answered ${status}`);
@@ -39,6 +55,7 @@ export function createTonboClient({
   fetch: fetchImpl = globalThis.fetch,
   now = () => Date.now(),
   timeoutMs = 20_000,
+  submitTimeoutMs = SUBMIT_TIMEOUT_MS,
 }) {
   const base = new URL(origin);
   // The token route lives on the application origin; the Management API origin admits only /v1.
@@ -54,8 +71,15 @@ export function createTonboClient({
   let cached = null;
   let exchanging = null;
 
+  async function send(url, init) {
+    try {
+      return await fetchImpl(url, init);
+    } catch (error) {
+      throw new TonboTransportError(error);
+    }
+  }
   async function exchange() {
-    const response = await fetchImpl(new URL("/api/iam/token", iam), {
+    const response = await send(new URL("/api/iam/token", iam), {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
@@ -76,12 +100,16 @@ export function createTonboClient({
     cached = await exchanging;
     return cached.token;
   }
-  async function request(path, { method = "GET", idempotencyKey, body } = {}, retried = false) {
+  async function request(
+    path,
+    { method = "GET", idempotencyKey, body, timeout = timeoutMs } = {},
+    retried = false,
+  ) {
     const bearer = await token();
-    const response = await fetchImpl(new URL(`/v1/agents/${agentId}${path}`, base), {
+    const response = await send(new URL(`/v1/agents/${agentId}${path}`, base), {
       method,
       redirect: "manual",
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(timeout),
       headers: {
         authorization: `Bearer ${bearer}`,
         ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -93,7 +121,7 @@ export function createTonboClient({
       // The cached token was revoked or expired early: exchange again once.
       // Every request is idempotent by key or read-only, so a retry is safe.
       cached = null;
-      return request(path, { method, idempotencyKey, body }, true);
+      return request(path, { method, idempotencyKey, body, timeout }, true);
     }
     const parsed = await response.json().catch(() => null);
     return { status: response.status, body: parsed, headers: response.headers };
@@ -133,6 +161,7 @@ export function createTonboClient({
           method: "POST",
           idempotencyKey: turnId,
           body: { session_id: sessionId, prompt },
+          timeout: submitTimeoutMs,
         }),
       );
     },

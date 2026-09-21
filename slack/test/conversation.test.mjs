@@ -443,10 +443,8 @@ test("sleeps for Retry-After when the event feed is rate limited and backs off w
     pollMs: 1000,
     sleep: async (ms) => void sleeps.push(ms),
   }).handle(message);
-  assert.deepEqual(
-    sleeps.filter((ms) => ms > 0),
-    [60000, 2000, 4000, 5000],
-  );
+  // The trailing grace wait for the recorded answer is not part of the cadence.
+  assert.deepEqual(sleeps.filter((ms) => ms > 0).slice(0, 4), [60000, 2000, 4000, 5000]);
 });
 
 test("the poll budget spaces reads across threads", () => {
@@ -457,4 +455,115 @@ test("the poll budget spaces reads across threads", () => {
   assert.equal(budget.reserve(), 1000);
   clock = 5000;
   assert.equal(budget.reserve(), 0);
+});
+
+const transport = () =>
+  Object.assign(new Error("The operation was aborted due to timeout"), { code: "transport" });
+
+test("a submission the network lost after text streamed completes through the feed", async () => {
+  const slack = fakeSlack();
+  let submissions = 0;
+  const tonbo = fakeTonbo({
+    pages: [
+      { events: [delta(1, "First sentence.")], status: "pending" },
+      { events: [delta(2, " Second.")], status: "completed" },
+    ],
+    submit: () => {
+      submissions += 1;
+      if (submissions === 1) throw transport();
+      return { state: "completed", data: { assistant_text: "First sentence. Second. Third." } };
+    },
+  });
+  const logs = [];
+  await createConversations({ ...base, tonbo, slack, log: (event) => logs.push(event) }).handle(
+    message,
+  );
+  assert.ok(submissions >= 2, "the idempotent submission is sent again");
+  assert.equal(tonbo.calls.filter((call) => call[0] === "abortTurn").length, 0);
+  const stops = slack.calls.filter((call) => call[0] === "stopStream");
+  assert.equal(stops.length, 1);
+  assert.deepEqual(stops[0], ["stopStream", "D0CHAN", "1782234700.000100", "", "active"]);
+  const streamed =
+    slack.calls.find((call) => call[0] === "startStream")[5] +
+    slack.calls
+      .filter((call) => call[0] === "appendStream")
+      .map((call) => call[3])
+      .join("");
+  assert.equal(streamed, "First sentence. Second. Third.");
+  assert.ok(!slack.calls.some((call) => String(call[3] ?? call[5]).includes("could not finish")));
+  assert.ok(logs.includes("turn_submit_unanswered"));
+  assert.ok(!logs.includes("turn_failed") && !logs.includes("turn_close_failed"));
+});
+
+test("a submission still open when the feed ends is replayed for the recorded answer", async () => {
+  const slack = fakeSlack();
+  let submissions = 0;
+  let releaseFirst;
+  const first = new Promise((resolve) => (releaseFirst = resolve));
+  const tonbo = fakeTonbo({
+    pages: [
+      { events: [delta(1, "Hello")], status: "pending" },
+      { events: [], status: "completed" },
+    ],
+    submit: () => {
+      submissions += 1;
+      return submissions === 1
+        ? first
+        : { state: "completed", data: { assistant_text: "Hello world" } };
+    },
+  });
+  const done = createConversations({ ...base, tonbo, slack }).handle(message);
+  await done;
+  releaseFirst({ state: "completed", data: { assistant_text: "Hello world" } });
+  assert.equal(submissions, 2);
+  assert.equal(slack.calls.filter((call) => call[0] === "appendStream").at(-1)[3], " world");
+  assert.deepEqual(slack.calls.at(-1), ["stopStream", "D0CHAN", "1782234700.000100", "", "active"]);
+});
+
+test("a lost operation poll is retried instead of failing the Turn", async () => {
+  const slack = fakeSlack();
+  let polls = 0;
+  const tonbo = fakeTonbo({
+    pages: [null],
+    submit: { state: "pending", operationId: "3f1e2d3c-4b5a-4968-8778-695a4b3c2d1e" },
+  });
+  tonbo.operation = async (id) => {
+    tonbo.calls.push(["operation", id]);
+    polls += 1;
+    if (polls === 1) throw transport();
+    return { state: "completed", data: { assistant_text: "after the hiccup" } };
+  };
+  await createConversations({ ...base, tonbo, slack }).handle(message);
+  assert.equal(polls, 2);
+  assert.equal(slack.calls[1][5], "after the hiccup");
+  assert.equal(slack.calls.at(-1)[0], "stopStream");
+});
+
+test("a Turn that produces nothing for the deadline is given up on", async () => {
+  const slack = fakeSlack();
+  let clock = 0;
+  let reads = 0;
+  const tonbo = fakeTonbo({ submit: () => new Promise(() => {}) });
+  tonbo.turnEvents = async () => {
+    tonbo.calls.push(["turnEvents"]);
+    reads += 1;
+    clock += 10 * 60 * 1000;
+    return reads === 1
+      ? { events: [delta(1, "Started")], status: "pending" }
+      : { events: [], status: "pending" };
+  };
+  const logs = [];
+  await createConversations({
+    ...base,
+    tonbo,
+    slack,
+    now: () => clock,
+    log: (event) => logs.push(event),
+  }).handle(message);
+  assert.ok(reads <= 5, `gave up after ${reads} reads`);
+  assert.ok(logs.includes("turn_no_progress"));
+  const last = slack.calls.at(-1);
+  assert.equal(last[0], "stopStream");
+  assert.match(last[3], /could not finish this reply: no progress for 30 minutes/);
+  assert.equal(tonbo.calls.filter((call) => call[0] === "abortTurn").length, 0);
 });

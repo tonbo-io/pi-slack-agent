@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTonboClient, problemMessage } from "../tonbo.mjs";
+import {
+  createTonboClient,
+  problemMessage,
+  SUBMIT_TIMEOUT_MS,
+  TonboTransportError,
+} from "../tonbo.mjs";
 
 const agentId = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e";
 const sessionId = "1f1e2d3c-4b5a-4968-8778-695a4b3c2d1e";
@@ -200,4 +205,36 @@ test("carries Retry-After from a refused event read", async () => {
     status: 429,
     retryAfterSeconds: 60,
   });
+});
+
+test("a submission may wait far longer than every other call", async () => {
+  // Every answer takes 60 ms; only the submission's budget covers that.
+  const fetchImpl = (url, init) =>
+    new Promise((resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(init.signal.reason));
+      const path = new URL(url).pathname;
+      const body = path.endsWith("/token")
+        ? { access_token: "tok", expires_in: 300 }
+        : path.endsWith("/turns")
+          ? { data: { turn_id: turnId, assistant_text: "late" } }
+          : { data: [], status: "pending" };
+      setTimeout(
+        () => resolve(new Response(JSON.stringify(body))),
+        path.endsWith("/token") ? 0 : 60,
+      );
+    });
+  const client = createTonboClient({
+    origin: "https://api.example.test",
+    apiKey: "tbo_x",
+    agentId,
+    fetch: fetchImpl,
+    timeoutMs: 20,
+    submitTimeoutMs: 330,
+  });
+  assert.equal((await client.submitTurn(sessionId, turnId, "hello")).state, "completed");
+  await assert.rejects(
+    () => client.turnEvents(sessionId, turnId, 0),
+    (error) => error instanceof TonboTransportError && error.code === "transport",
+  );
+  assert.equal(SUBMIT_TIMEOUT_MS, 330_000);
 });
