@@ -17,7 +17,7 @@ The template is currently being integrated into Tonbo's browser onboarding. This
 - While the Turn runs, the service follows its event feed and appends assistant text to a native Slack stream. A Turn that fails ends with a notice that names the reason the platform recorded.
 - Pressing Slack's stop button aborts the Turn and closes the stream immediately.
 - Files attached to a message are downloaded into `/workspace/inbox/slack/<file id>/<file name>` and named in the prompt, so the Agent reads them with its ordinary tools. Files over 50 MiB are refused.
-- The service keeps its state in memory. It does not read channel history or post outside the thread it was addressed in.
+- The service persists delivery checkpoints in Workspace under exclusive named Activity ownership. It does not read channel history or post outside the thread it was addressed in.
 
 ## Make it yours
 
@@ -49,3 +49,25 @@ The service acquires named runtime Activity and synchronously saves its Turn che
 Checkpoints preserve the prompt, acknowledged response text, partial event offset and open Slack stream. They are serialized and atomically replaced in Workspace. An uncertain Slack write is retained for reconciliation, rather than replayed or declared successful. Corrupt records are retained and fail closed. Lease expiry does not authorize another process to emit effects.
 
 An unexpected service exit makes runtime health unavailable; the platform physically retires that runtime before another process may recover its named work. In-process service restart is deliberately removed because it cannot establish that the old execution owner is fenced. Snapshot and node-transfer acceptance remain separate from deployment overlap.
+
+## Incremental Slack delivery
+
+The durable Turn event feed is consumed through a bounded `AsyncIterable` batching transform. Each available page (at most 100 events) is flushed without waiting for the full answer; adjacent text deltas are combined up to Slack's 12,000-character request limit. Idle polling is capped at one second and all threads share the existing request budget. Unread events remain in the platform's durable feed rather than an unbounded application queue.
+
+Each external stream write records its intent before calling Slack and commits delivery plus the cursor after success. A partial batch records its exact end sequence, text and offset, so a restart cannot change the batch boundary or resend an acknowledged prefix. Text checkpoints are no longer rewritten for each token. Slow HTTP and checkpoint operations are timed separately in `slack_stream_write`; `turn_feed_read` measures event retrieval. Logs contain counts and identities, not message text or credentials.
+
+Native `chat.startStream`, `chat.appendStream`, and `chat.stopStream` remain the primary delivery API. A stream is rotated before its next append after four minutes (an application policy, not a claimed Slack SLA), or before reaching the message-size limit. An explicit `message_not_in_streaming_state` retires that stream and continues only the rejected text. Transport failures remain uncertain: the checkpoint is retained without guessing or opening a duplicate reply. Existing uncertain checkpoints are not automatically reclassified.
+
+This follows the async-iterable composition used by [Vercel Chat SDK](https://chat-sdk.dev/docs/streaming) and the buffering principle of [Slack's ChatStreamer](https://github.com/slackapi/node-slack-sdk/blob/main/packages/web-api/src/chat-stream.ts), while preserving Tonbo's durable ownership and delivery boundaries. It adds no runtime dependency. This is incremental consumption of the current paged API, not a claim that the platform endpoint has become SSE.
+
+## Template ownership and publication
+
+The authoritative template source is `examples/pi-slack-agent` in `tonbo-io/cloud`. The reviewed `pi-slack-template.yml` workflow validates and packages this directory, then publishes the exact tree to `tonbo-io/pi-slack-agent`. Fix reusable Slack behavior here rather than patching user-created deployment repositories. Template publication does not automatically modify existing user repositories or promote their deployed Agents; those upgrades remain explicit user actions.
+
+### Customization boundary
+
+This is a Slack application starter for Tonbo's supported Pi runtime. Slack event verification, rate limits, stream lifecycle and delivery recovery are reusable transport behavior. Agent instructions, project tools and the project brief are the application customization surface. The starter deliberately does not prescribe a team's business workflow or require an additional Agent framework.
+
+`createConversations` accepts `batchChars` (default 12,000; maximum constrained by Slack) and `streamMaxAgeMs` (default 240,000; an adjustable rotation policy), in addition to the existing polling, logging, client and store options. Available pages flush immediately even below the batch threshold, so short answers do not wait for a buffer to fill. `eventBatches` takes a caller-supplied size bound and knows no Slack limits. The existing durable `processingEvent` field now also represents a multi-event batch; both existing partial single-event checkpoints and new batch checkpoints resume under the same ownership rules.
+
+Required platform capabilities are a durable ordered Turn event feed, idempotent Turn submission, revision-isolated source, Workspace storage and named Activity ownership. These are explicit Tonbo dependencies; the starter does not claim to be portable to arbitrary runtimes without adapters. Real Slack delivery, including native stream expiry and rate limits, still needs provider acceptance; mocked performance tests do not prove that acceptance.

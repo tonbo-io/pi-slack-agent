@@ -1,11 +1,13 @@
 import path from "node:path";
+import { eventBatches } from "./event-batches.mjs";
 import { slackAgentInput } from "./identity.mjs";
 import { createInflightStore } from "./inflight.mjs";
 
 export const SLACK_INBOX = "/workspace/inbox/slack";
 const STOPPED_LINE = "\n\n_Stopped._";
 const BUSY_RETRY_LIMIT = 150;
-const MAX_POLL_MS = 5000;
+const MAX_POLL_MS = 1000;
+const STREAM_ROTATE_MS = 240_000;
 const MAX_RETRY_AFTER_SECONDS = 3600;
 const TRANSPORT_RETRY_MS = 5000;
 /** Slack accepts at most 12,000 characters per stream call and truncates a
@@ -84,6 +86,8 @@ export function createConversations({
   inbox = SLACK_INBOX,
   log = () => {},
   pollMs = 1000,
+  batchChars = STREAM_CHUNK_CHARS,
+  streamMaxAgeMs = STREAM_ROTATE_MS,
   budget = createPollBudget(),
   deadlineMs = NO_PROGRESS_DEADLINE_MS,
   now = () => Date.now(),
@@ -92,6 +96,10 @@ export function createConversations({
   activities,
 }) {
   if (!activities) throw new Error("Named Activity client is required.");
+  if (!Number.isSafeInteger(batchChars) || batchChars < 1 || batchChars > STREAM_CHUNK_CHARS)
+    throw new RangeError(`batchChars must be between 1 and ${STREAM_CHUNK_CHARS}.`);
+  if (!Number.isSafeInteger(streamMaxAgeMs) || streamMaxAgeMs < 1)
+    throw new RangeError("streamMaxAgeMs must be a positive integer.");
   const accepting = new Map();
   const threads = new Map();
   const turns = new Map();
@@ -120,7 +128,7 @@ export function createConversations({
       return await operation();
     } catch (error) {
       if (error?.code !== "ratelimited") throw error;
-      await sleep(Math.min(error.retryAfterSeconds ?? 5, 60) * 1000);
+      await sleep(Math.min(error.retryAfterSeconds ?? 5, MAX_RETRY_AFTER_SECONDS) * 1000);
       return operation();
     }
   }
@@ -140,7 +148,10 @@ export function createConversations({
         result = await tonbo.submitTurn(turn.sessionId, turn.turnId, prompt);
       } catch (error) {
         if (!isTransport(error)) throw error;
-        log("turn_submit_unanswered", { turn: turn.turnId, reason: error.message });
+        log("turn_submit_unanswered", {
+          turn: turn.turnId,
+          reason: error.message,
+        });
         await sleep(TRANSPORT_RETRY_MS);
         continue;
       }
@@ -170,7 +181,10 @@ export function createConversations({
         outcome = await tonbo.operation(operationId);
       } catch (error) {
         if (!isTransport(error)) throw error;
-        log("turn_operation_unanswered", { turn: turn.turnId, reason: error.message });
+        log("turn_operation_unanswered", {
+          turn: turn.turnId,
+          reason: error.message,
+        });
         continue;
       }
       if (outcome.state === "failed" && outcome.status === 404) return null;
@@ -184,13 +198,56 @@ export function createConversations({
       turn.lease.assertOwned();
       if (turn.pendingEffect) throw new Error("Slack write requires reconciliation.");
       if ((kind === "close" || kind === "stop") && turn.closed) return;
+      const effectStarted = now();
       turn.pendingEffect = { kind, streamTs: turn.streamTs };
       await store.save(turn);
+      const checkpointBeforeMs = now() - effectStarted;
       turn.lease.assertOwned();
-      const result = await slackWrite(invoke);
+      const started = now();
+      let result;
+      try {
+        result = await slackWrite(() => {
+          turn.lease.assertOwned();
+          return invoke();
+        });
+      } catch (error) {
+        if (error?.code !== "message_not_in_streaming_state" || kind === "start") throw error;
+        // Slack explicitly rejected this operation: no uncertain append to
+        // replay. Persist the retired stream before opening its continuation.
+        turn.streamTs = null;
+        turn.messageChars = 0;
+        turn.streamOpenedAt = null;
+        turn.pendingEffect = null;
+        await store.save(turn);
+        log("slack_stream_retired", {
+          turn: turn.turnId,
+          kind,
+          reason: error.code,
+        });
+        return false;
+      }
       apply(result);
+      if (
+        turn.processingEvent &&
+        turn.processingEvent.offset >= [...turn.processingEvent.text].length
+      ) {
+        turn.cursor = turn.processingEvent.sequence;
+        turn.processingEvent = null;
+      }
+      const httpMs = now() - started;
       turn.pendingEffect = null;
+      const commitStarted = now();
       await store.save(turn);
+      log("slack_stream_write", {
+        turn: turn.turnId,
+        kind,
+        httpMs,
+        checkpointBeforeMs,
+        checkpointAfterMs: now() - commitStarted,
+        deliveredChars: [...turn.streamed].length,
+        cursor: turn.cursor,
+      });
+      return true;
     });
     turn.effectQueue = operation;
     return operation;
@@ -210,6 +267,7 @@ export function createConversations({
         }),
       (ts) => {
         turn.streamTs = ts;
+        turn.streamOpenedAt = now();
         turn.messageChars = [...text].length;
         turn.streamed += text;
         if (turn.processingEvent) turn.processingEvent.offset += [...text].length;
@@ -224,12 +282,21 @@ export function createConversations({
       turn.processingEvent ||= { sequence, text, offset: 0 };
       if (turn.processingEvent.sequence !== sequence || turn.processingEvent.text !== text)
         throw new Error("Checkpoint event differs from the authoritative feed.");
-      await store.save(turn);
       text = [...text].slice(turn.processingEvent.offset).join("");
+      if (!text) {
+        turn.cursor = sequence;
+        turn.processingEvent = null;
+        await store.save(turn);
+        return;
+      }
     }
-    for (const chunk of chunkText(text)) {
+    for (const chunk of chunkText(text, batchChars)) {
       if (turn.cancelled) return;
-      if (turn.streamTs !== null && turn.messageChars + [...chunk].length > MESSAGE_CHARS) {
+      if (
+        turn.streamTs !== null &&
+        (turn.messageChars + [...chunk].length > MESSAGE_CHARS ||
+          (turn.streamOpenedAt != null && now() - turn.streamOpenedAt >= streamMaxAgeMs))
+      ) {
         await effect(
           turn,
           "rotate",
@@ -241,8 +308,8 @@ export function createConversations({
         );
       }
       if (turn.streamTs === null) await openStream(turn, chunk);
-      else
-        await effect(
+      else {
+        const sent = await effect(
           turn,
           "append",
           () => slack.appendStream(turn.channelId, turn.streamTs, chunk),
@@ -252,12 +319,28 @@ export function createConversations({
             if (turn.processingEvent) turn.processingEvent.offset += [...chunk].length;
           },
         );
+        if (!sent && !turn.cancelled) await openStream(turn, chunk);
+      }
     }
-    if (sequence !== null && !turn.cancelled) {
-      turn.cursor = sequence;
-      turn.processingEvent = null;
+  }
+
+  async function consumePage(turn, events) {
+    const fresh = events.filter((event) => Number(event.sequence) > turn.cursor);
+    for await (const batch of eventBatches(fresh, {
+      pending: turn.processingEvent,
+      maxChars: batchChars,
+    })) {
+      if (turn.cancelled) return;
+      if (batch.text) await stream(turn, batch.text, batch.sequence);
+      else turn.cursor = batch.sequence;
+    }
+    // Text batches already commit their cursor with the provider receipt.
+    // Persist trailing control events once, not once per model token.
+    if (
+      fresh.length &&
+      (fresh.at(-1).event_type !== "assistant.delta" || !fresh.at(-1).payload?.text)
+    )
       await store.save(turn);
-    }
   }
 
   async function closeStream(turn, text, sessionStatus) {
@@ -269,7 +352,7 @@ export function createConversations({
       text = "";
     }
     if (turn.cancelled || turn.streamTs === null || turn.closed) return;
-    await effect(
+    const closed = await effect(
       turn,
       "close",
       () => slack.stopStream(turn.channelId, turn.streamTs, text, sessionStatus),
@@ -277,13 +360,22 @@ export function createConversations({
         turn.closed = true;
       },
     );
+    if (!closed) {
+      if (text) {
+        await stream(turn, text);
+        await closeStream(turn, "", sessionStatus);
+      } else {
+        turn.closed = true;
+        await store.save(turn);
+      }
+    }
   }
 
   async function closeStopped(turn) {
     if (turn.closed || turn.streamTs === null) return;
     const trailer =
       turn.messageChars + [...STOPPED_LINE].length > MESSAGE_CHARS ? "" : STOPPED_LINE;
-    await effect(
+    const stopped = await effect(
       turn,
       "stop",
       () => slack.stopStream(turn.channelId, turn.streamTs, trailer, "active"),
@@ -291,27 +383,37 @@ export function createConversations({
         turn.closed = true;
       },
     );
+    if (!stopped) {
+      turn.closed = true;
+      await store.save(turn);
+    }
+  }
+
+  async function readPage(turn) {
+    const started = now();
+    const page = await tonbo.turnEvents(turn.sessionId, turn.turnId, turn.cursor);
+    log("turn_feed_read", {
+      turn: turn.turnId,
+      ms: now() - started,
+      events: page?.events.length ?? 0,
+      status: page?.status,
+      cursor: turn.cursor,
+    });
+    return page;
   }
 
   async function drain(turn) {
     while (!turn.cancelled) {
       await sleep(budget.reserve());
-      const page = await tonbo
-        .turnEvents(turn.sessionId, turn.turnId, turn.cursor)
-        .catch((error) => {
-          log("turn_events_failed", { code: error?.code, status: error?.status });
-          return null;
-        });
+      const page = await readPage(turn).catch((error) => {
+        log("turn_events_failed", { code: error?.code, status: error?.status });
+        return null;
+      });
       // Only rows past the cursor count; a page that adds nothing ends the drain.
       const fresh =
         page?.events.filter((event) => (Number(event.sequence) || 0) > turn.cursor) ?? [];
       if (fresh.length === 0) return;
-      for (const event of fresh) {
-        if (event.event_type === "assistant.delta" && typeof event.payload?.text === "string")
-          await stream(turn, event.payload.text, Number(event.sequence));
-        turn.cursor = Number(event.sequence);
-        await store.save(turn);
-      }
+      await consumePage(turn, fresh);
     }
   }
 
@@ -323,7 +425,10 @@ export function createConversations({
         return value;
       },
       (error) => {
-        settled = { state: "failed", message: error?.message || "request failed" };
+        settled = {
+          state: "failed",
+          message: error?.message || "request failed",
+        };
         return settled;
       },
     );
@@ -348,8 +453,11 @@ export function createConversations({
       let progressed = false;
       do {
         await sleep(budget.reserve());
-        page = await tonbo.turnEvents(turn.sessionId, turn.turnId, turn.cursor).catch((error) => {
-          log("turn_events_failed", { code: error?.code, status: error?.status });
+        page = await readPage(turn).catch((error) => {
+          log("turn_events_failed", {
+            code: error?.code,
+            status: error?.status,
+          });
           if (error?.status === 429 || error?.retryAfterSeconds)
             delay = Math.min(error.retryAfterSeconds ?? 60, MAX_RETRY_AFTER_SECONDS) * 1000;
           return { events: [], status: "pending" };
@@ -364,18 +472,11 @@ export function createConversations({
           };
         }
         if (page === null) break;
-        for (const event of page.events) {
+        if (page.events.length) {
           progressed = true;
           progressAt = now();
-          // TODO: consecutive assistant messages of one Turn arrive without a
-          // boundary and are joined as-is; the coordinator's projection will
-          // mark `assistant.delta` boundaries, so no separator is invented here.
-          if (event.event_type === "assistant.delta" && typeof event.payload?.text === "string")
-            await stream(turn, event.payload.text, Number(event.sequence));
-          turn.cursor = Math.max(turn.cursor, Number(event.sequence) || 0);
-          await store.save(turn);
+          await consumePage(turn, page.events);
         }
-        if (progressed) await store.save(turn);
         if (page.status !== "pending") {
           // The status can settle on a page that is not the last: drain
           // every later row before the answer is finished.
@@ -389,7 +490,10 @@ export function createConversations({
       if (settled && settled.state !== "pending") return outcome(settled.state);
       if (now() - progressAt > deadlineMs) {
         turn.done = true;
-        log("turn_no_progress", { turn: turn.turnId, minutes: Math.round(deadlineMs / 60_000) });
+        log("turn_no_progress", {
+          turn: turn.turnId,
+          minutes: Math.round(deadlineMs / 60_000),
+        });
         throw new Error("Turn progress deadline exceeded; ownership and checkpoint retained.");
       }
       // Back off while nothing arrives; a delta resets the cadence.
@@ -456,13 +560,20 @@ export function createConversations({
       if (!turn.closed) await slack.setStatus(turn.channelId, turn.threadTs, "active");
       await store.complete(turn);
       await turn.lease.release();
-      log("turn_finished", { turn: turn.turnId, status: result.status, resumed: turn.resumed });
+      log("turn_finished", {
+        turn: turn.turnId,
+        status: result.status,
+        resumed: turn.resumed,
+      });
     } catch (error) {
       // A failed/uncertain provider write is not completion. Preserve the
       // checkpoint and named ownership; never guess or emit a second reply.
       turn.done = true;
       turn.lease.abandon();
-      log("turn_reconciliation_required", { turn: turn.turnId, reason: error?.message });
+      log("turn_reconciliation_required", {
+        turn: turn.turnId,
+        reason: error?.message,
+      });
     } finally {
       releaseLocal(turn);
     }
@@ -582,13 +693,19 @@ export function createConversations({
     const abort = tonbo
       .abortTurn(turn.sessionId, turn.turnId, command.idempotencyKey)
       .catch((error) => {
-        log("turn_abort_failed", { turn: turn.turnId, reason: error?.code || error?.message });
+        log("turn_abort_failed", {
+          turn: turn.turnId,
+          reason: error?.code || error?.message,
+        });
         return null;
       });
     if (turn.streamTs !== null) await closeStopped(turn);
     else await slack.setStatus(command.channelId, command.threadTs, "active");
     const result = await abort;
-    log("turn_stopped", { turn: turn.turnId, abort: result?.state ?? "failed" });
+    log("turn_stopped", {
+      turn: turn.turnId,
+      abort: result?.state ?? "failed",
+    });
   }
 
   return {

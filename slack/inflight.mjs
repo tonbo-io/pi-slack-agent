@@ -14,6 +14,7 @@ const fields = [
   "threadTs",
   "userId",
   "streamTs",
+  "streamOpenedAt",
   "messageChars",
   "streamed",
   "cursor",
@@ -92,7 +93,12 @@ export function createInflightStore({ directory = SLACK_INFLIGHT } = {}) {
     },
     complete(turn) {
       return serial(turn.turnId, () =>
-        write({ version: 2, turnId: turn.turnId, sessionId: turn.sessionId, completed: true }),
+        write({
+          version: 2,
+          turnId: turn.turnId,
+          sessionId: turn.sessionId,
+          completed: true,
+        }),
       );
     },
     async list() {
