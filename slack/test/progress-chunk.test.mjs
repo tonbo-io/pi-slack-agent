@@ -8,7 +8,7 @@ test("native progress and answer text use chunks without incompatible markdown_t
   assert.deepEqual(streamPayload("hello", [chunk]), {
     chunks: [chunk, { type: "markdown_text", text: "hello" }],
   });
-  assert.deepEqual(streamPayload("hello"), { markdown_text: "hello" });
+  assert.deepEqual(streamPayload("hello"), { chunks: [{ type: "markdown_text", text: "hello" }] });
   assert.deepEqual(streamPayload("", [chunk]), { chunks: [chunk] });
 });
 
@@ -38,4 +38,11 @@ test("outcomes retain one task identity without presenting cancellation as succe
   );
   assert.equal(new Set(chunks.map((chunk) => chunk.id)).size, 1);
   assert.equal(chunks[2].title, "Stopped");
+});
+
+test("a waiting greeting shows its phase without a meaningless zero tool count", () => {
+  const chunk = progressChunk({ phase: "waiting", elapsedSeconds: 2, toolsCompleted: 0 });
+  assert.equal(chunk.hide_title, false);
+  assert.equal(chunk.title, "Waiting for the next response");
+  assert.equal(chunk.details, "2s elapsed");
 });

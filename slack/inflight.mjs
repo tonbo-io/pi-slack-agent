@@ -14,6 +14,7 @@ const fields = [
   "threadTs",
   "userId",
   "streamTs",
+  "streamFormat",
   "streamOpenedAt",
   "messageChars",
   "streamed",

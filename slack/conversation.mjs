@@ -76,6 +76,30 @@ export function createPollBudget({ perMinute = 120, now = () => Date.now() } = {
   };
 }
 
+/** Transitional recovery for the deployed pre-chunks template. Its first
+ * text append after a progress-only start was necessarily markdown_text and
+ * Slack cannot apply it to that chunks stream. Do not generalize this to a
+ * chunks-era checkpoint or any previously delivered/rotated stream. */
+export function rejectedLegacyFirstAppend(record) {
+  return (
+    record?.version === 2 &&
+    record.streamFormat === undefined &&
+    record.pendingEffect?.kind === "append" &&
+    typeof record.streamTs === "string" &&
+    record.pendingEffect.streamTs === record.streamTs &&
+    record.streamed === "" &&
+    record.messageChars === 0 &&
+    Number.isFinite(record.progressShownAt) &&
+    record.progressShownAt === record.streamOpenedAt &&
+    record.processingEvent?.offset === 0 &&
+    typeof record.processingEvent.text === "string" &&
+    record.processingEvent.text.length > 0 &&
+    !record.completed &&
+    !record.cancelled &&
+    !record.closed
+  );
+}
+
 /** Drives one Slack thread's Turns: submits, follows the event feed, streams
  * assistant text into Slack, honours stop, and reports failure. State lives in
  * a durable checkpoint under exclusive named Activity ownership. */
@@ -690,6 +714,11 @@ export function createConversations({
         done: false,
         lease,
       };
+      if (rejectedLegacyFirstAppend(record)) {
+        turn.pendingEffect = null;
+        log("slack_rejected_legacy_append_recovered", { turn: turnId });
+      }
+      turn.streamFormat = "chunks";
       turn.progress ??= initialProgress(turn.startedAt);
       await store.save(turn);
       turns.set(turnId, turn);

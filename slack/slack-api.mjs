@@ -6,12 +6,11 @@ import { Transform } from "node:stream";
 
 export const MAX_FILE_BYTES = 50 * 1024 * 1024;
 
-/** Slack refuses markdown_text together with chunks. Keep text and native
- * progress in one ordered stream request when both are available. */
+/** A Slack stream keeps the mode selected at start for its entire lifetime.
+ * Always encode text as a chunk, including text-only appends and final text. */
 export function streamPayload(text, chunks = []) {
-  if (chunks.length)
-    return { chunks: [...chunks, ...(text ? [{ type: "markdown_text", text }] : [])] };
-  return text ? { markdown_text: text } : {};
+  const payload = [...chunks, ...(text ? [{ type: "markdown_text", text }] : [])];
+  return payload.length ? { chunks: payload } : {};
 }
 
 export class SlackApiError extends Error {

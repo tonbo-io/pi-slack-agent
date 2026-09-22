@@ -5,6 +5,7 @@ import {
   createConversations as createConversationsImpl,
   createPollBudget,
   remainderAfter,
+  rejectedLegacyFirstAppend,
 } from "../conversation.mjs";
 
 function createConversations(options) {
@@ -1390,3 +1391,85 @@ test("a long tool wait updates one native task before the exact final answer", a
   assert.equal(closed[5][0].status, "complete");
   assert.ok(!JSON.stringify(slack.calls).includes("SECRET"));
 });
+
+test("only the legacy first plain-text append to a progress-only stream is provably rejected", () => {
+  const record = {
+    version: 2,
+    streamTs: "1.0",
+    pendingEffect: { kind: "append", streamTs: "1.0" },
+    streamed: "",
+    messageChars: 0,
+    progressShownAt: 10,
+    streamOpenedAt: 10,
+    processingEvent: { sequence: 2, text: "Hello", offset: 0 },
+  };
+  assert.equal(rejectedLegacyFirstAppend(record), true);
+  for (const change of [
+    { streamFormat: "chunks" },
+    { streamed: "H" },
+    { messageChars: 1 },
+    { pendingEffect: { kind: "start" } },
+    { pendingEffect: { kind: "append", streamTs: "2.0" } },
+    { progressShownAt: undefined },
+    { streamOpenedAt: 11 },
+    { cancelled: true },
+    { processingEvent: { sequence: 2, text: "Hello", offset: 1 } },
+  ]) {
+    assert.equal(rejectedLegacyFirstAppend({ ...record, ...change }), false);
+  }
+});
+
+test("restart recovers the rejected legacy first append without regenerating or duplicating text", () =>
+  durableFixture(async (store) => {
+    const command = slackAgentInput({
+      agentId,
+      teamId: base.teamId,
+      botUserId: base.botUserId,
+      event: message,
+    });
+    const started = Date.now();
+    await store.save({
+      ...command,
+      turnId: command.idempotencyKey,
+      command,
+      prompt: "hello",
+      streamed: "",
+      streamTs: "1782234700.000100",
+      messageChars: 0,
+      cursor: 0,
+      startedAt: Date.now(),
+      processingEvent: { sequence: 1, text: "Hello", offset: 0 },
+      pendingEffect: { kind: "append", streamTs: "1782234700.000100" },
+      streamOpenedAt: started,
+      progressShownAt: started,
+      closed: false,
+    });
+    const slack = fakeSlack();
+    const tonbo = fakeTonbo({
+      pages: [
+        { events: [delta(1, "Hello")], status: "completed" },
+        { events: [], status: "completed" },
+      ],
+      submit: { state: "completed", data: { assistant_text: "Hello" } },
+    });
+    let resolve;
+    const completed = new Promise((done) => {
+      resolve = done;
+    });
+    const conversations = createConversations({
+      ...base,
+      store,
+      slack,
+      tonbo,
+      activities: ownerships()("new", resolve),
+    });
+    await conversations.resume();
+    await completed;
+    assert.deepEqual(
+      slack.calls.filter(([name]) => name === "appendStream").map((call) => call[3]),
+      ["Hello"],
+    );
+    assert.equal(slack.calls.filter(([name]) => name === "startStream").length, 0);
+    assert.equal(tonbo.calls.find(([name]) => name === "submitTurn")[3], "hello");
+    assert.equal((await store.get(command.idempotencyKey)).completed, true);
+  }));

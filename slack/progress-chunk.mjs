@@ -14,11 +14,12 @@ const titles = {
 export function progressChunk(view) {
   const details = view.stale
     ? `${view.elapsedSeconds}s elapsed · No new progress for ${view.quietSeconds}s`
-    : `${view.elapsedSeconds}s elapsed · ${view.toolsCompleted} tools finished`;
+    : `${view.elapsedSeconds}s elapsed${view.toolsCompleted ? ` · ${view.toolsCompleted} tools finished` : ""}`;
   return {
     type: "task_update",
     id: "execution",
     title: titles[view.phase] ?? titles.waiting,
+    hide_title: false,
     status:
       view.phase === "failed" || view.phase === "cancelled"
         ? "error"

@@ -63,7 +63,7 @@ test("calls Slack methods with the bot token and surfaces Slack errors", async (
         thread_ts: "1.000000",
         recipient_user_id: "U1",
         recipient_team_id: "T1",
-        markdown_text: "hi",
+        chunks: [{ type: "markdown_text", text: "hi" }],
       });
       await assert.rejects(() => slack.appendStream("D1", "1.000001", "x"), {
         code: "invalid_auth",
@@ -189,3 +189,43 @@ test("never sends the bot token to a host that is not Slack", async () => {
   assert.equal(isSlackFileUrl("https://slack.com/x"), true);
   assert.equal(isSlackFileUrl("not a url"), false);
 });
+
+// Exercise requests across one stream, not just each method in isolation.
+for (const progressFirst of [true, false]) {
+  test(`one Slack stream retains chunks mode, progress first: ${progressFirst}`, async () => {
+    let mode;
+    const received = [];
+    const slack = createSlackClient({
+      botToken: "test",
+      fetch: async (_url, init) => {
+        const body = JSON.parse(init.body);
+        const next = body.chunks ? "chunks" : body.markdown_text ? "markdown_text" : mode;
+        if (mode && mode !== next)
+          return Response.json({ ok: false, error: "streaming_mode_mismatch" });
+        mode = next;
+        received.push(...(body.chunks ?? []));
+        return Response.json({ ok: true, ts: "1.000001" });
+      },
+    });
+    const task = { type: "task_update", id: "execution", title: "Working", status: "in_progress" };
+    await slack.startStream({
+      channelId: "D1",
+      threadTs: "1.0",
+      userId: "U1",
+      teamId: "T1",
+      text: progressFirst ? "" : "Hello",
+      chunks: progressFirst ? [task] : [],
+    });
+    await slack.appendStream("D1", "1.000001", " answer");
+    await slack.appendStream("D1", "1.000001", "", [task]);
+    await slack.stopStream("D1", "1.000001", "!", "active", [{ ...task, status: "complete" }]);
+    assert.equal(mode, "chunks");
+    assert.equal(
+      received
+        .filter((x) => x.type === "markdown_text")
+        .map((x) => x.text)
+        .join(""),
+      progressFirst ? " answer!" : "Hello answer!",
+    );
+  });
+}
