@@ -1312,3 +1312,23 @@ test("delivery policy is customizable while Slack request limits stay enforced",
     assert.throws(() => createConversations({ ...base, batchChars }), /batchChars/);
   assert.throws(() => createConversations({ ...base, streamMaxAgeMs: 0 }), /streamMaxAgeMs/);
 });
+
+test("cancelled work archives its checkpoint without Slack or Turn effects", async () => {
+  const slack = fakeSlack();
+  const tonbo = fakeTonbo({});
+  const cancelled = [];
+  const conversations = createConversations({
+    ...base,
+    slack,
+    tonbo,
+    activities: { acquire: async () => ({ cancelled: true, cancellationId: "cancel-id" }) },
+    store: {
+      cancel: async (...args) => cancelled.push(args),
+      list: async () => [{ turnId: "old-turn", command: {} }],
+    },
+  });
+  await conversations.resume();
+  assert.deepEqual(cancelled, [["old-turn", "cancel-id"]]);
+  assert.deepEqual(slack.calls, []);
+  assert.deepEqual(tonbo.calls, []);
+});

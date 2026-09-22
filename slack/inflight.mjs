@@ -91,6 +91,15 @@ export function createInflightStore({ directory = SLACK_INFLIGHT } = {}) {
         await write(record);
       });
     },
+    cancel(turnId, cancellationId) {
+      return serial(turnId, async () => {
+        const record = await get(turnId);
+        if (!record || record.completed) return;
+        // Preserve the full uncertain-effect evidence; cancellation is not a
+        // successful delivery and must never trigger a provider write.
+        await write({ ...record, completed: true, cancelled: true, cancellationId });
+      });
+    },
     complete(turn) {
       return serial(turn.turnId, () =>
         write({

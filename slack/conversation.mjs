@@ -587,6 +587,11 @@ export function createConversations({
       if (await store.get(turnId)) return () => {};
       throw new Error("Turn ownership was acquired before durable acceptance; retry.");
     }
+    if (lease.cancelled) {
+      await store.cancel(turnId, lease.cancellationId);
+      log("turn_cancelled", { turn: turnId, cancellation: lease.cancellationId });
+      return () => {};
+    }
     try {
       const record = await store.get(turnId);
       if (record?.completed) {

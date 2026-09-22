@@ -48,6 +48,8 @@ The service acquires named runtime Activity and synchronously saves its Turn che
 
 Checkpoints preserve the prompt, acknowledged response text, partial event offset and open Slack stream. They are serialized and atomically replaced in Workspace. An uncertain Slack write is retained for reconciliation, rather than replayed or declared successful. Corrupt records are retained and fail closed. Lease expiry does not authorize another process to emit effects.
 
+An administrator may explicitly cancel selected named work on an exact retired runtime through `tonbo deployments cancel-activities`. After the platform confirms physical retirement, recovery retains the full checkpoint with `cancelled: true` and a `cancellationId`; it emits no Slack or Turn effects. A cancellation request alone is not completion.
+
 An unexpected service exit makes runtime health unavailable; the platform physically retires that runtime before another process may recover its named work. In-process service restart is deliberately removed because it cannot establish that the old execution owner is fenced. Snapshot and node-transfer acceptance remain separate from deployment overlap.
 
 ## Incremental Slack delivery

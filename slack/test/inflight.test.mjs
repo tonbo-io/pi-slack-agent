@@ -52,3 +52,23 @@ test("corrupt checkpoints are preserved and fail closed", () =>
     assert.equal(await readFile(filename, "utf8"), "incomplete");
     await assert.rejects(store.get("../other"));
   }));
+
+test("cancellation retains uncertain evidence and late saves cannot resurrect it", () =>
+  fixture(async (store, directory) => {
+    const record = {
+      turnId,
+      sessionId,
+      streamed: "acknowledged",
+      pendingEffect: { kind: "append", streamTs: "123.456" },
+      processingEvent: { sequence: 7, text: "uncertain" },
+    };
+    await store.save(record);
+    await store.cancel(turnId, "cancel-id");
+    await store.save(record);
+    const cancelled = await createInflightStore({ directory }).get(turnId);
+    assert.equal(cancelled.cancelled, true);
+    assert.equal(cancelled.cancellationId, "cancel-id");
+    assert.deepEqual(cancelled.pendingEffect, record.pendingEffect);
+    assert.deepEqual(cancelled.processingEvent, record.processingEvent);
+    assert.deepEqual(await store.list(), []);
+  }));

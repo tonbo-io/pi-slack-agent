@@ -64,3 +64,13 @@ test("a delayed admission response cannot extend ownership beyond its original e
   assert.throws(() => lease.assertOwned(), /uncertain/);
   lease.abandon();
 });
+
+test("a physically fenced cancellation grants no execution lease", async () => {
+  const cancellationId = "00000000-0000-4000-8000-000000000003";
+  const client = createActivityClient({
+    origin: "http://localhost/activity",
+    fetchImpl: async () =>
+      new Response(JSON.stringify({ state: "cancelled", cancellation_id: cancellationId })),
+  });
+  assert.deepEqual(await client.acquire("cancelled-work"), { cancelled: true, cancellationId });
+});

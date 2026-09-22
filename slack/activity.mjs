@@ -21,6 +21,14 @@ export function createActivityClient({ origin, fetchImpl = fetch, owner = random
       const startedAt = Date.now();
       const admitted = await request("POST", "", { work_key: workKey, owner_instance: owner });
       if (!admitted) return null;
+      if (admitted.state === "cancelled") {
+        if (
+          typeof admitted.cancellation_id !== "string" ||
+          !/^[0-9a-f-]{36}$/i.test(admitted.cancellation_id)
+        )
+          throw new Error("Invalid Activity cancellation response.");
+        return { cancelled: true, cancellationId: admitted.cancellation_id };
+      }
       const { lease_id: id, lease_seconds: seconds } = admitted;
       if (typeof id !== "string" || !Number.isFinite(seconds) || seconds < 5)
         throw new Error("Invalid Activity admission response.");
