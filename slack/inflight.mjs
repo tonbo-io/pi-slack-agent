@@ -24,6 +24,9 @@ const fields = [
   "closed",
   "pendingEffect",
   "processingEvent",
+  "progress",
+  "progressShownAt",
+  "progressShownPhase",
   "completed",
 ];
 

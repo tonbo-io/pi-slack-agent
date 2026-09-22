@@ -2,6 +2,8 @@ import path from "node:path";
 import { eventBatches } from "./event-batches.mjs";
 import { slackAgentInput } from "./identity.mjs";
 import { createInflightStore } from "./inflight.mjs";
+import { initialProgress, reduceProgress, progressView } from "./progress.mjs";
+import { progressChunk } from "./progress-chunk.mjs";
 
 export const SLACK_INBOX = "/workspace/inbox/slack";
 const STOPPED_LINE = "\n\n_Stopped._";
@@ -326,6 +328,9 @@ export function createConversations({
 
   async function consumePage(turn, events) {
     const fresh = events.filter((event) => Number(event.sequence) > turn.cursor);
+    // Save the observed projection with every provider receipt. If a text
+    // write is interrupted, replaying earlier facts cannot erase later ones.
+    turn.progress = fresh.reduce(reduceProgress, turn.progress);
     for await (const batch of eventBatches(fresh, {
       pending: turn.processingEvent,
       maxChars: batchChars,
@@ -343,7 +348,58 @@ export function createConversations({
       await store.save(turn);
   }
 
-  async function closeStream(turn, text, sessionStatus) {
+  /** Coalesce task updates independently of token cadence. The same named
+   * Activity fences both native progress and text; no detached writer can
+   * outlive cancellation or deployment ownership. */
+  async function showProgress(turn) {
+    if (turn.cancelled || turn.closed || now() - turn.startedAt < 2000) return;
+    const view = progressView(turn.progress, now());
+    const chunk = progressChunk(view);
+    const phaseChanged = turn.progressShownPhase !== view.phase;
+    const interval = phaseChanged ? 2000 : 10_000;
+    if (turn.progressShownAt != null && now() - turn.progressShownAt < interval) return;
+    if (turn.streamTs === null) {
+      await effect(
+        turn,
+        "start",
+        () =>
+          slack.startStream({
+            channelId: turn.channelId,
+            threadTs: turn.threadTs,
+            userId: turn.userId,
+            teamId,
+            text: "",
+            chunks: [chunk],
+          }),
+        (ts) => {
+          turn.streamTs = ts;
+          turn.streamOpenedAt = now();
+          turn.messageChars = 0;
+          turn.progressShownAt = now();
+          turn.progressShownPhase = view.phase;
+        },
+      );
+    } else {
+      await effect(
+        turn,
+        "progress",
+        () => slack.appendStream(turn.channelId, turn.streamTs, "", [chunk]),
+        () => {
+          turn.progressShownAt = now();
+          turn.progressShownPhase = view.phase;
+        },
+      );
+    }
+  }
+
+  function finalProgress(turn, phase) {
+    if (turn.progressShownAt == null) return undefined;
+    return [
+      progressChunk({ ...progressView(turn.progress, now()), phase, terminal: true, stale: false }),
+    ];
+  }
+
+  async function closeStream(turn, text, sessionStatus, phase = "completed") {
     if (
       [...text].length > STREAM_CHUNK_CHARS ||
       turn.messageChars + [...text].length > MESSAGE_CHARS
@@ -355,7 +411,14 @@ export function createConversations({
     const closed = await effect(
       turn,
       "close",
-      () => slack.stopStream(turn.channelId, turn.streamTs, text, sessionStatus),
+      () =>
+        slack.stopStream(
+          turn.channelId,
+          turn.streamTs,
+          text,
+          sessionStatus,
+          finalProgress(turn, phase),
+        ),
       () => {
         turn.closed = true;
       },
@@ -363,7 +426,7 @@ export function createConversations({
     if (!closed) {
       if (text) {
         await stream(turn, text);
-        await closeStream(turn, "", sessionStatus);
+        await closeStream(turn, "", sessionStatus, phase);
       } else {
         turn.closed = true;
         await store.save(turn);
@@ -378,7 +441,14 @@ export function createConversations({
     const stopped = await effect(
       turn,
       "stop",
-      () => slack.stopStream(turn.channelId, turn.streamTs, trailer, "active"),
+      () =>
+        slack.stopStream(
+          turn.channelId,
+          turn.streamTs,
+          trailer,
+          "active",
+          finalProgress(turn, "cancelled"),
+        ),
       () => {
         turn.closed = true;
       },
@@ -488,6 +558,7 @@ export function createConversations({
       // and the settled answer is the only signal. A pending answer with an
       // absent feed is a Turn the coordinator has not claimed yet.
       if (settled && settled.state !== "pending") return outcome(settled.state);
+      await showProgress(turn);
       if (now() - progressAt > deadlineMs) {
         turn.done = true;
         log("turn_no_progress", {
@@ -520,7 +591,7 @@ export function createConversations({
         branch: remainder.branch,
         chars: [...remainder.text].length,
       });
-      if (turn.streamTs === null && !remainder.text && !turn.streamed)
+      if (!remainder.text && !turn.streamed)
         await stream(turn, "The Agent completed without a text response.");
       else if (remainder.text) await stream(turn, remainder.text);
       await closeStream(turn, "", "active");
@@ -529,7 +600,7 @@ export function createConversations({
     const message = settled?.message || `Turn ${result.status}`;
     const notice = noticeFor(message);
     if (turn.streamTs === null) await stream(turn, notice);
-    await closeStream(turn, turn.streamed === notice ? "" : `\n\n${notice}`, "active");
+    await closeStream(turn, turn.streamed === notice ? "" : `\n\n${notice}`, "active", "failed");
   }
 
   function releaseLocal(turn) {
@@ -619,6 +690,7 @@ export function createConversations({
         done: false,
         lease,
       };
+      turn.progress ??= initialProgress(turn.startedAt);
       await store.save(turn);
       turns.set(turnId, turn);
       threads.set(key(turn.channelId, turn.threadTs), turn);

@@ -20,7 +20,7 @@ function createConversations(options) {
     store: {
       get: async (id) => records.get(id) ?? null,
       save: async (turn) => {
-        const { lease, effectQueue, ...record } = turn;
+        const { lease: _lease, effectQueue: _effectQueue, ...record } = turn;
         records.set(turn.turnId, structuredClone(record));
       },
       complete: async (turn) => records.set(turn.turnId, { turnId: turn.turnId, completed: true }),
@@ -61,13 +61,22 @@ function fakeSlack() {
     calls,
     setStatus: async (channel, thread, status) =>
       calls.push(["setStatus", channel, thread, status]),
-    startStream: async ({ channelId, threadTs, userId, teamId, text }) => {
-      calls.push(["startStream", channelId, threadTs, userId, teamId, text]);
+    startStream: async ({ channelId, threadTs, userId, teamId, text, chunks }) => {
+      calls.push([
+        "startStream",
+        channelId,
+        threadTs,
+        userId,
+        teamId,
+        text,
+        ...(chunks ? [chunks] : []),
+      ]);
       return "1782234700.000100";
     },
-    appendStream: async (channel, ts, text) => calls.push(["appendStream", channel, ts, text]),
-    stopStream: async (channel, ts, text, status) =>
-      calls.push(["stopStream", channel, ts, text, status]),
+    appendStream: async (channel, ts, text, chunks) =>
+      calls.push(["appendStream", channel, ts, text, ...(chunks ? [chunks] : [])]),
+    stopStream: async (channel, ts, text, status, chunks) =>
+      calls.push(["stopStream", channel, ts, text, status, ...(chunks ? [chunks] : [])]),
     downloadFile: async (file, directory) => {
       calls.push(["downloadFile", file.id, directory]);
       if (file.id === "FBAD") throw Object.assign(new Error("too large"), { code: "too_large" });
@@ -676,7 +685,9 @@ test("a stalled Turn retains its checkpoint and ownership without claiming compl
   assert.ok(reads <= 5, `gave up after ${reads} reads`);
   assert.ok(logs.includes("turn_no_progress"));
   const last = slack.calls.at(-1);
-  assert.equal(last[0], "startStream");
+  assert.equal(last[0], "appendStream");
+  assert.equal(last[4][0].status, "in_progress");
+  assert.match(last[4][0].details, /No new progress/);
   assert.ok(logs.includes("turn_reconciliation_required"));
   assert.equal(slack.calls.filter((call) => call[0] === "stopStream").length, 0);
   assert.equal(tonbo.calls.filter((call) => call[0] === "abortTurn").length, 0);
@@ -1331,4 +1342,51 @@ test("cancelled work archives its checkpoint without Slack or Turn effects", asy
   assert.deepEqual(cancelled, [["old-turn", "cancel-id"]]);
   assert.deepEqual(slack.calls, []);
   assert.deepEqual(tonbo.calls, []);
+});
+
+test("a long tool wait updates one native task before the exact final answer", async () => {
+  const slack = fakeSlack();
+  let clock = 0;
+  let reads = 0;
+  let finish;
+  const submitted = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const tonbo = fakeTonbo({ submit: () => submitted });
+  tonbo.turnEvents = async () => {
+    reads += 1;
+    clock += 11_000;
+    if (reads === 1)
+      return {
+        status: "pending",
+        events: [
+          {
+            sequence: 1,
+            event_type: "tool.started",
+            created_at: new Date(clock).toISOString(),
+            payload: { tool_call_id: "a", tool_name: "bash", arguments: "SECRET" },
+          },
+        ],
+      };
+    if (reads < 5) return { status: "pending", events: [] };
+    finish({ state: "completed", data: { assistant_text: "Done." } });
+    return { status: "completed", events: [] };
+  };
+  await createConversations({ ...base, tonbo, slack, now: () => clock }).handle(message);
+  const opened = slack.calls.filter((call) => call[0] === "startStream");
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0][5], "");
+  assert.equal(opened[0][6][0].title, "Running tools");
+  const updates = slack.calls.filter((call) => call[0] === "appendStream" && call[4]);
+  assert.ok(updates.length >= 2);
+  assert.match(updates.at(-1)[4][0].details, /No new progress/);
+  assert.ok(updates.every((call) => call[4][0].id === "execution"));
+  const answers = slack.calls.filter((call) => call[0] === "appendStream" && !call[4]);
+  assert.deepEqual(
+    answers.map((call) => call[3]),
+    ["Done."],
+  );
+  const closed = slack.calls.find((call) => call[0] === "stopStream");
+  assert.equal(closed[5][0].status, "complete");
+  assert.ok(!JSON.stringify(slack.calls).includes("SECRET"));
 });

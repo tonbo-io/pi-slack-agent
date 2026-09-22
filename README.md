@@ -62,6 +62,14 @@ Native `chat.startStream`, `chat.appendStream`, and `chat.stopStream` remain the
 
 This follows the async-iterable composition used by [Vercel Chat SDK](https://chat-sdk.dev/docs/streaming) and the buffering principle of [Slack's ChatStreamer](https://github.com/slackapi/node-slack-sdk/blob/main/packages/web-api/src/chat-stream.ts), while preserving Tonbo's durable ownership and delivery boundaries. It adds no runtime dependency. This is incremental consumption of the current paged API, not a claim that the platform endpoint has become SSE.
 
+## Execution progress
+
+After two seconds, a pending reply can open a native Slack task update before any answer text arrives. The task reports the observed tool or output phase, elapsed time and completed tool count. Phase changes are coalesced to at most one update every two seconds, with elapsed-time refreshes at most every ten seconds while the feed loop is responsive. Thirty seconds without an execution fact is labelled as no new progress; silence is not reported as model reasoning or failure. Fast replies retain the existing text-only path.
+
+`progress.mjs` reduces redacted execution events without a Slack dependency. `progress-chunk.mjs` maps its view into one stable native task identity. Progress and answer text share Activity fencing and the existing uncertain-write checkpoint; no detached progress publisher can write after losing ownership. Final task status is sent with stream closure, and a stopped request is explicitly labelled Stopped. No tool arguments or output appear in progress.
+
+This adapter currently consumes the existing paged Turn feed. Independent service/runtime deployment and the Durable Streams subscription transport are separate in-progress platform work. The current co-located service cannot display progress before its own Sandbox resumes.
+
 ## Template ownership and publication
 
 The authoritative template source is `examples/pi-slack-agent` in `tonbo-io/cloud`. The reviewed `pi-slack-template.yml` workflow validates and packages this directory, then publishes the exact tree to `tonbo-io/pi-slack-agent`. Fix reusable Slack behavior here rather than patching user-created deployment repositories. Template publication does not automatically modify existing user repositories or promote their deployed Agents; those upgrades remain explicit user actions.

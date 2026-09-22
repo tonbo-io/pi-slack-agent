@@ -6,6 +6,14 @@ import { Transform } from "node:stream";
 
 export const MAX_FILE_BYTES = 50 * 1024 * 1024;
 
+/** Slack refuses markdown_text together with chunks. Keep text and native
+ * progress in one ordered stream request when both are available. */
+export function streamPayload(text, chunks = []) {
+  if (chunks.length)
+    return { chunks: [...chunks, ...(text ? [{ type: "markdown_text", text }] : [])] };
+  return text ? { markdown_text: text } : {};
+}
+
 export class SlackApiError extends Error {
   constructor(method, code, retryAfterSeconds) {
     super(`Slack ${method} failed: ${code}`);
@@ -74,24 +82,28 @@ export function createSlackClient({
     call,
     setStatus: (channelId, threadTs, status) =>
       call("agents.sessions.setStatus", { channel_id: channelId, thread_ts: threadTs, status }),
-    async startStream({ channelId, threadTs, userId, teamId, text }) {
+    async startStream({ channelId, threadTs, userId, teamId, text, chunks }) {
       const body = await call("chat.startStream", {
         channel: channelId,
         thread_ts: threadTs,
         recipient_user_id: userId,
         recipient_team_id: teamId,
-        ...(text ? { markdown_text: text } : {}),
+        ...streamPayload(text, chunks),
       });
       if (typeof body.ts !== "string") throw new SlackApiError("chat.startStream", "missing_ts");
       return body.ts;
     },
-    appendStream: (channelId, streamTs, text) =>
-      call("chat.appendStream", { channel: channelId, ts: streamTs, markdown_text: text }),
-    stopStream: (channelId, streamTs, text, sessionStatus = "active") =>
+    appendStream: (channelId, streamTs, text, chunks) =>
+      call("chat.appendStream", {
+        channel: channelId,
+        ts: streamTs,
+        ...streamPayload(text, chunks),
+      }),
+    stopStream: (channelId, streamTs, text, sessionStatus = "active", chunks) =>
       call("chat.stopStream", {
         channel: channelId,
         ts: streamTs,
-        ...(text ? { markdown_text: text } : {}),
+        ...streamPayload(text, chunks),
         session_status: sessionStatus,
       }),
     /** Downloads one shared file into `<directory>/<file id>/<safe name>` with
